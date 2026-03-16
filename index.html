@@ -1,27 +1,27 @@
 <!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>GesturPlay Worker</title>
-</head>
+<head><meta charset="UTF-8"><title>GesturPlay Worker</title></head>
 <body>
 <video id="v" autoplay muted playsinline
   style="position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0"></video>
 <script>
-const cfg={hand:'right',fps:12,confidence:0.7,cooldown:1200};
+const cfg={hand:'right',fps:12,confidence:0.75,cooldown:1500};
 let handLandmarker=null,stream=null,frameTimer=null;
 let lastGesture=null,lastGestureTime=0;
 let lastFrameTime=0,detectionActive=true;
 
-// Motion tracking
-const posHistory=[];  // wrist positions over time
-const HIST=15;
+const posHistory=[];
+const HIST=18;
 let stillCount=0;
 let maxRecentMotion=0;
-const STILL_FRAMES=8;    // ~0.65s of stillness = pause
-const STILL_THRESH=0.02; // wrist movement below this = still
-const SWIPE_MIN=0.18;    // minimum wrist travel for swipe
-const VERT_MIN=0.15;     // minimum wrist travel for volume
+
+// Tuned thresholds
+const STILL_FRAMES=10;   // ~0.85s stillness = pause
+const STILL_THRESH=0.03;
+const MIN_MOTION_FOR_PAUSE=0.12; // must have moved significantly first
+const SWIPE_MIN=0.22;    // horizontal swipe minimum
+const VERT_MIN=0.22;     // vertical minimum — increased to reduce false vol triggers
+const DIRECTION_RATIO=2.0; // must be twice as strong in one direction
 
 const vid=document.getElementById('v');
 
@@ -49,35 +49,49 @@ function triggerGesture(g){
 }
 
 function classifyFromHistory(){
-  if(posHistory.length < 6) return null;
+  // Need at least 8 frames of consistent data
+  if(posHistory.length < 8) return null;
 
-  const xs=posHistory.map(p=>p.x);
-  const ys=posHistory.map(p=>p.y);
+  const recent = posHistory.slice(-10);
+  const xs=recent.map(p=>p.x);
+  const ys=recent.map(p=>p.y);
   const dx=xs[xs.length-1]-xs[0];
   const dy=ys[ys.length-1]-ys[0];
   const absDx=Math.abs(dx);
   const absDy=Math.abs(dy);
 
-  // PLAY — right to left physical motion
-  // In raw camera feed (not mirrored): right-to-left = negative dx
-  if(absDx > SWIPE_MIN && absDx > absDy*1.8){
+  // Must have meaningful total travel
+  const totalTravel = Math.hypot(absDx, absDy);
+  if(totalTravel < 0.15) return null;
+
+  // PLAY — strong horizontal right-to-left
+  // horizontal must dominate vertical significantly
+  if(absDx > SWIPE_MIN && absDx > absDy * DIRECTION_RATIO){
     if(dx < -SWIPE_MIN) return 'play';
   }
 
-  // VOLUME — vertical dominates
-  if(absDy > VERT_MIN && absDy > absDx*1.5){
-    if(dy < -VERT_MIN) return 'vol_up';   // moved up
-    if(dy >  VERT_MIN) return 'vol_dn';   // moved down
+  // VOLUME — strong vertical, must dominate horizontal significantly
+  // Extra check: majority of frames must move in same vertical direction
+  if(absDy > VERT_MIN && absDy > absDx * DIRECTION_RATIO){
+    // Check consistency — count frames moving in dominant direction
+    let upFrames=0, dnFrames=0;
+    for(let i=1;i<recent.length;i++){
+      if(recent[i].y < recent[i-1].y) upFrames++;
+      else dnFrames++;
+    }
+    const consistency = recent.length - 1;
+    // Need 70% of frames moving same direction
+    if(dy < -VERT_MIN && upFrames/consistency > 0.7) return 'vol_up';
+    if(dy >  VERT_MIN && dnFrames/consistency > 0.7) return 'vol_dn';
   }
 
   return null;
 }
 
-function processLandmarks(landmarks, ts){
+function processLandmarks(landmarks){
   if(!landmarks||!landmarks.length){
-    // No hand detected — check for stillness pause
     stillCount++;
-    if(stillCount===STILL_FRAMES && maxRecentMotion > 0.08){
+    if(stillCount===STILL_FRAMES && maxRecentMotion > MIN_MOTION_FOR_PAUSE){
       triggerGesture('pause');
     }
     return;
@@ -87,16 +101,14 @@ function processLandmarks(landmarks, ts){
   const lm=landmarks[0];
   const wrist={x:lm[0].x, y:lm[0].y};
 
-  // Track wrist position
   posHistory.push(wrist);
   if(posHistory.length>HIST) posHistory.shift();
 
-  // Track how much wrist has moved recently
   if(posHistory.length>=2){
     const prev=posHistory[posHistory.length-2];
     const movement=Math.hypot(wrist.x-prev.x, wrist.y-prev.y);
     if(movement>maxRecentMotion) maxRecentMotion=movement;
-    maxRecentMotion*=0.95; // decay
+    maxRecentMotion*=0.95;
   }
 
   const g=classifyFromHistory();
@@ -115,7 +127,7 @@ async function start(config){
     return;
   }
   vid.srcObject=stream;
-  try{ await vid.play(); }catch(e){}
+  try{await vid.play();}catch(e){}
 
   try{
     const mp=await import('https://esm.sh/@mediapipe/tasks-vision@0.10.7');
@@ -145,7 +157,7 @@ async function start(config){
       lastFrameTime=ts;
       try{
         const results=handLandmarker.detectForVideo(vid,ts);
-        processLandmarks(results.landmarks, ts);
+        processLandmarks(results.landmarks);
       }catch(e){}
     }
     frameTimer=requestAnimationFrame(frame);
