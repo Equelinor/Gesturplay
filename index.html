@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>GesturPlay Worker</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.cjs" crossorigin="anonymous"></script>
+</head>
+<body>
+<video id="v" autoplay muted playsinline
+  style="position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0"></video>
+<script>
+const cfg={hand:'right',fps:10,confidence:0.7,cooldown:1200};
+let handLandmarker=null,stream=null,frameTimer=null;
+let lastGesture=null,lastGestureTime=0;
+let swipeSamples=[],lastPalmX=null;
+let arcHistory=[],detectionActive=true,lastFrameTime=0;
+const ARC_HISTORY=12,ARC_MIN=0.10;
+const vid=document.getElementById('v');
+
+function send(type,extra={}){
+  try{window.parent.postMessage({type,...extra},'*');}catch(e){}
+}
+
+window.addEventListener('message',(e)=>{
+  const msg=e.data;
+  if(!msg||!msg.type) return;
+  if(msg.type==='GP_INIT')   start(msg.cfg);
+  if(msg.type==='GP_STOP')   teardown();
+  if(msg.type==='GP_PAUSE')  detectionActive=false;
+  if(msg.type==='GP_RESUME') detectionActive=true;
+  if(msg.type==='GP_HAND')   cfg.hand=msg.hand;
+});
+
+function checkLighting(v){
+  try{
+    const c=document.createElement('canvas');c.width=16;c.height=16;
+    const x=c.getContext('2d');x.drawImage(v,0,0,16,16);
+    const d=x.getImageData(0,0,16,16).data;let b=0;
+    for(let i=0;i<d.length;i+=4)b+=(d[i]+d[i+1]+d[i+2])/3;
+    return b/(d.length/4);
+  }catch{return 128;}
+}
+
+function classifyStatic(lm){
+  const w=lm[0],it=lm[8],mt=lm[12],rt=lm[16],pt=lm[20];
+  const im=lm[5],mm=lm[9],rm=lm[13],pm=lm[17];
+  const up=(t,m)=>t.y<m.y-0.04;
+  const iU=up(it,im),mU=up(mt,mm),rU=up(rt,rm),pU=up(pt,pm);
+  if(iU&&mU&&rU&&pU&&lm[9].z<lm[0].z+0.1) return 'open_palm';
+  if(iU&&!mU&&!rU&&!pU){
+    if(it.y<w.y-0.15) return 'point_up';
+    if(it.y>w.y+0.05) return 'point_down';
+  }
+  return null;
+}
+
+function detectArc(){
+  if(arcHistory.length<ARC_HISTORY) return null;
+  const f=arcHistory[0],l=arcHistory[arcHistory.length-1],dx=l.x-f.x;
+  const mid=arcHistory[Math.floor(arcHistory.length/2)];
+  if(Math.abs(dx)<ARC_MIN) return null;
+  const L=cfg.hand==='left';
+  if(dx>ARC_MIN&&mid.y>f.y-0.02) return L?'arc_ccw':'arc_cw';
+  if(dx<-ARC_MIN&&mid.y>f.y-0.02) return L?'arc_cw':'arc_ccw';
+  return null;
+}
+
+function detectSwipe(){
+  if(swipeSamples.length<6) return null;
+  const net=swipeSamples.reduce((a,b)=>a+b,0),L=cfg.hand==='left';
+  if(!L&&net<-0.10) return 'swipe_right';
+  if(L&&net>0.10) return 'swipe_left';
+  return null;
+}
+
+function triggerGesture(g){
+  const now=Date.now();
+  if(g===lastGesture&&now-lastGestureTime<cfg.cooldown) return;
+  lastGesture=g;lastGestureTime=now;
+  arcHistory=[];swipeSamples=[];
+  send('GP_GESTURE',{gesture:g});
+}
+
+function processLandmarks(landmarks){
+  if(!landmarks||!landmarks.length){lastPalmX=null;swipeSamples=[];arcHistory=[];return;}
+  const lm=landmarks[0],it=lm[8],px=lm[9].x;
+  arcHistory.push({x:it.x,y:it.y});
+  if(arcHistory.length>ARC_HISTORY) arcHistory.shift();
+  if(lastPalmX!==null){swipeSamples.push(px-lastPalmX);if(swipeSamples.length>10)swipeSamples.shift();}
+  lastPalmX=px;
+  const arc=detectArc(); if(arc){triggerGesture(arc);return;}
+  const swp=detectSwipe(); if(swp){triggerGesture(swp);swipeSamples=[];return;}
+  const sta=classifyStatic(lm); if(sta) triggerGesture(sta);
+}
+
+async function start(config){
+  if(handLandmarker) return;
+  if(config) Object.assign(cfg,config);
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{width:320,height:240,facingMode:'user',frameRate:{ideal:10,max:15}}
+    });
+  }catch(err){
+    send('GP_CAM_ERROR',{errType:err.name==='NotFoundError'?'no_camera':'permission_denied'});
+    return;
+  }
+  vid.srcObject=stream; await vid.play();
+  setTimeout(()=>{if(checkLighting(vid)<40)send('GP_LOW_LIGHT');},1500);
+  try{
+    const {HandLandmarker,FilesetResolver}=window;
+    const vision=await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+    );
+    handLandmarker=await HandLandmarker.createFromOptions(vision,{
+      baseOptions:{
+        modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate:'CPU'
+      },
+      runningMode:'VIDEO',numHands:1,
+      minHandDetectionConfidence:cfg.confidence,
+      minHandPresenceConfidence:cfg.confidence,
+      minTrackingConfidence:0.5,
+    });
+  }catch(e){send('GP_LOAD_ERROR');return;}
+  const interval=1000/cfg.fps;
+  function frame(ts){
+    if(!handLandmarker) return;
+    if(detectionActive&&ts-lastFrameTime>=interval){
+      lastFrameTime=ts;
+      try{processLandmarks(handLandmarker.detectForVideo(vid,ts).landmarks);}catch(e){}
+    }
+    frameTimer=requestAnimationFrame(frame);
+  }
+  frameTimer=requestAnimationFrame(frame);
+  send('GP_READY');
+}
+
+function teardown(){
+  if(frameTimer){cancelAnimationFrame(frameTimer);frameTimer=null;}
+  if(handLandmarker){try{handLandmarker.close();}catch(e){}handLandmarker=null;}
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  lastPalmX=null;swipeSamples=[];arcHistory=[];
+}
+
+window.addEventListener('load',()=>send('GP_PAGE_READY'));
+</script>
+</body>
+</html>
