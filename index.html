@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>GesturPlay Worker</title>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.cjs" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.js" crossorigin="anonymous"></script>
 </head>
 <body>
 <video id="v" autoplay muted playsinline
@@ -108,8 +108,9 @@ async function start(config){
   setTimeout(()=>{if(checkLighting(vid)<40)send('GP_LOW_LIGHT');},1500);
   try{
     const {HandLandmarker,FilesetResolver}=window;
+    if(!HandLandmarker) throw new Error('MediaPipe not loaded yet');
     const vision=await FilesetResolver.forVisionTasks(
-      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
     );
     handLandmarker=await HandLandmarker.createFromOptions(vision,{
       baseOptions:{
@@ -121,7 +122,11 @@ async function start(config){
       minHandPresenceConfidence:cfg.confidence,
       minTrackingConfidence:0.5,
     });
-  }catch(e){send('GP_LOAD_ERROR');return;}
+  }catch(e){
+    console.error('MediaPipe init error:',e);
+    send('GP_LOAD_ERROR');
+    return;
+  }
   const interval=1000/cfg.fps;
   function frame(ts){
     if(!handLandmarker) return;
